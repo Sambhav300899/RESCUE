@@ -1,3 +1,6 @@
 [submodule "lseg-minimal"]
 	path = lseg-minimal
 	url = https://github.com/krrish94/lseg-minimal.git
+[submodule "map-anything"]
+	path = map-anything
+	url = https://github.com/facebookresearch/map-anything.git
