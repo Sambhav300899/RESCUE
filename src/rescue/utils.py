@@ -4,9 +4,10 @@ import tempfile
 import torch
 import tqdm
 import xarray as xr
+import geopandas as gpd
 import numpy as np
 import cv2
-
+from shapely.geometry import box
 import trimesh
 import pyrender
 
@@ -60,10 +61,18 @@ def sample_video(video_path, fps, output_dir=None):
     return output_dir, sampled_indices
 
 
-def get_png_from_naip(naip_path):
+def get_png_from_naip(naip_path, in_utm_crs = False):
     sample_img = xr.open_dataset(naip_path)
+    sample_img = sample_img.rio.write_crs("EPSG:4326")
 
-    rgb = sample_img.to_array()[1].values[:3, :, :]
+    if in_utm_crs:
+        minx, miny, maxx, maxy = sample_img.rio.bounds()
+
+        utm_crs = gpd.GeoDataFrame(geometry=[box(minx, miny, maxx, maxy)], crs="EPSG:4326").estimate_utm_crs()
+        print (utm_crs)
+        sample_img = sample_img.rio.reproject("EPSG:26914")
+
+    rgb = sample_img.to_array()[0].values[:3, :, :]
     rgb = np.moveaxis(rgb, 0, -1).astype("uint8")
 
     return rgb

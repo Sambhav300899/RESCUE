@@ -51,6 +51,25 @@ def _apply_glb_orientation(pts: np.ndarray) -> np.ndarray:
     return np.asarray(pts, dtype=np.float64) @ _R_GLB_UPRIGHT
 
 
+def _make_pin_mesh(position: np.ndarray, scale: float, color=(220, 50, 50)):
+    """Red map pin: sphere bulb on top, cone apex pointing down at `position`."""
+    r = scale * 0.01
+    h = scale * 0.04
+
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=r)
+    sphere.apply_translation([0.0, 0.0, h + r])
+
+    # trimesh cone has base at z=0, apex at z=h — flip so apex points down at z=0
+    cone = trimesh.creation.cone(radius=r * 0.55, height=h, sections=32)
+    cone.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0]))
+    cone.apply_translation([0.0, 0.0, h])
+
+    pin = trimesh.util.concatenate([sphere, cone])
+    pin.visual.vertex_colors = np.tile([*color, 255], (len(pin.vertices), 1)).astype(np.uint8)
+    pin.apply_translation(position)
+    return pin
+
+
 def show_mesh(server, path, apply_orientation_fix: bool, center_override=None):
     """
     Center mesh for display. If ``center_override`` is set (e.g. mean of ``world_points``
@@ -135,6 +154,7 @@ def show_query(
     center,
     point_size=0.05,
     apply_orientation_fix: bool = True,
+    georeg_path: str = None,
 ):
     # Lazy-load CLIP + safetensors on first Search. Loading them at startup blocks the
     # main thread so the Viser web client can sit on "Loading…" with no GUI/scene.
@@ -173,12 +193,66 @@ def show_query(
                 except Exception:
                     pass
 
-    query_text = server.gui.add_text("Query",        initial_value="building")
-    threshold  = server.gui.add_slider("Threshold",  min=0.0, max=1.0, step=0.01, initial_value=0.85)
-    opacity    = server.gui.add_slider("Opacity",    min=0.0, max=1.0, step=0.01, initial_value=0.85)
-    render_as  = server.gui.add_dropdown("Render as", options=["points", "splats"], initial_value="splats")
-    size       = server.gui.add_slider("Size", min=0.001, max=0.25, step=0.001, initial_value=float(point_size) * 0.25)
-    stable     = server.gui.add_checkbox("Stable splats preset", initial_value=True)
+    # Load georeg KD-tree for click-based lat/lon lookup
+    if georeg_path is not None:
+        from scipy.spatial import cKDTree
+        georeg_data = load_file(georeg_path)
+        georeg_wp = georeg_data["world_points"].numpy()  # (N, 3) world space
+        georeg_latlon = georeg_data["latlon"].numpy()    # (N, 2)
+
+        # Convert to display space to match what viser renders
+        display_pts = georeg_wp - center
+        if apply_orientation_fix:
+            display_pts = _apply_glb_orientation(display_pts)
+        georeg_display_tree = cKDTree(display_pts)
+        print(f"[georeg] Loaded {len(georeg_latlon):,} georeg points for click lookup")
+
+        locate_mode = server.gui.add_checkbox("Locate mode (click to pin)", initial_value=False)
+        lat_text  = server.gui.add_text("Lat/Lon", initial_value="—")
+        maps_text = server.gui.add_markdown("*Enable locate mode, then click a point*")
+
+        marker_handle = [None]
+        scene_scale   = float(np.linalg.norm(display_pts.max(axis=0) - display_pts.min(axis=0)))
+
+        def on_click(event: viser.ScenePointerEvent) -> None:
+            ray_o = np.array(event.ray_origin,    dtype=np.float64)
+            ray_d = np.array(event.ray_direction, dtype=np.float64)
+            ray_d /= np.linalg.norm(ray_d)
+
+            d = display_pts - ray_o
+            t = np.maximum(np.dot(d, ray_d), 0.0)
+            perp = d - t[:, None] * ray_d
+            dist = np.linalg.norm(perp, axis=1)
+            idx = int(np.argmin(dist))
+
+            lat, lon = float(georeg_latlon[idx, 0]), float(georeg_latlon[idx, 1])
+            lat_text.value = f"{lat:.6f}, {lon:.6f}"
+            url = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
+            maps_text.content = f'<a href="{url}" target="_blank">Open in Google Maps</a>'
+            print(f"[georeg] click → lat={lat:.6f} lon={lon:.6f} (ray dist={dist[idx]:.3f})")
+
+            if marker_handle[0] is not None:
+                try:
+                    marker_handle[0].remove()
+                except Exception:
+                    pass
+            pin = _make_pin_mesh(display_pts[idx], scale=scene_scale)
+            marker_handle[0] = server.scene.add_mesh_trimesh(name="georeg_marker", mesh=pin)
+
+        def _toggle_locate(_=None) -> None:
+            if locate_mode.value:
+                server.scene.on_pointer_event(event_type="click")(on_click)
+            else:
+                try:
+                    server.scene.remove_pointer_callback()
+                except Exception:
+                    pass
+
+        locate_mode.on_update(_toggle_locate)
+
+    query_text = server.gui.add_text("Query",       initial_value="building")
+    threshold  = server.gui.add_slider("Threshold", min=0.0, max=1.0, step=0.01, initial_value=0.85)
+    size       = server.gui.add_slider("Size",      min=0.001, max=0.25, step=0.001, initial_value=float(point_size) * 0.25)
     max_query  = server.gui.add_slider("Max query points", min=1_000, max=2_000_000, step=1_000, initial_value=250_000)
     run_btn    = server.gui.add_button("Search")
 
@@ -195,7 +269,6 @@ def show_query(
         if N == 0:
             return
 
-        # Deterministic downsample to reduce overlap flicker + frontend load.
         max_n = int(max_query.value)
         if N > max_n:
             idx = np.linspace(0, N - 1, max_n, dtype=int)
@@ -203,38 +276,13 @@ def show_query(
             N = len(points)
             print(f"Downsampled query to {N:,} points")
 
-        # Gaussian splats are view-dependent (alpha compositing + depth sorting),
-        # so a point-cloud overlay is often a better "mask" visualization.
-        if render_as.value == "points":
-            last_query_handle[0] = server.scene.add_point_cloud(
-                name="query",
-                points=points.astype(np.float32),
-                colors=np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (N, 1)),
-                point_size=float(size.value),
-                precision="float32",
-            )
-        else:
-            # "Stable" preset: tighter splats + higher opacity.
-            if stable.value:
-                splat_opacity = 0.95
-                splat_size = float(size.value)
-                # Make splats tighter than point-size suggests.
-                cov_scale = (splat_size * 0.35) ** 2
-            else:
-                splat_opacity = float(opacity.value)
-                splat_size = float(size.value)
-                cov_scale = splat_size ** 2
-
-            rgbs        = np.tile([1.0, 0.0, 0.0], (N, 1)).astype(np.float32)
-            opacities   = np.full((N, 1), float(splat_opacity), dtype=np.float32)
-            covariances = np.tile(np.eye(3) * cov_scale, (N, 1, 1)).astype(np.float32)
-            last_query_handle[0] = server.scene.add_gaussian_splats(
-                name="query",
-                centers=points.astype(np.float32),
-                covariances=covariances,
-                rgbs=rgbs,
-                opacities=opacities,
-            )
+        last_query_handle[0] = server.scene.add_point_cloud(
+            name="query",
+            points=points.astype(np.float32),
+            colors=np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (N, 1)),
+            point_size=float(size.value),
+            precision="float32",
+        )
 
     run_btn.on_click(do_query)
 
@@ -278,6 +326,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--glb",        required=True, help="Path to .glb file")
     parser.add_argument("--features",   default=None,  help="Path to .safetensors language features file")
+    parser.add_argument("--georeg",     default=None,  help="Path to .safetensors georeg file for click-based lat/lon")
     parser.add_argument("--mode",       choices=["mesh", "points"], default=None,
                         help="Display mode. Auto: filename (*mesh.glb / *points.glb), else GLB contents.")
     parser.add_argument("--host",       default="0.0.0.0")
@@ -330,7 +379,7 @@ def main():
         )
 
     if args.features is not None:
-        show_query(server, args.features, center, args.point_size, apply_orientation_fix=fix)
+        show_query(server, args.features, center, args.point_size, apply_orientation_fix=fix, georeg_path=args.georeg)
 
     # MapAnything / RESCUE reconstructions follow ENU-style coords: X/Y span the
     # site, Z is vertical (+Z up). Viser's default scene up is +Z — match that so

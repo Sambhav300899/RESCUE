@@ -76,6 +76,7 @@ def run_mapanything(
     ges_path,
     fps=2,
     num_views=-1,
+    use_ges=True,
     temp_dir="../generated/temp",
     model_local_dir="../generated/map-anything",
     device="cuda" if torch.cuda.is_available() else "cpu",
@@ -135,44 +136,46 @@ def run_mapanything(
     else:
         views = load_images(files_dir, resolution_set=rs, norm_type=nt)[:num_views]
 
-    poses, c2w_list, K_list, orig_width, orig_height = ges_utils.convert_ges_to_mapanything_from_file(
-        ges_path, ref_frame=0
-    )
-    if num_views == -1:
-        poses = [poses[i] for i in sampled_indices]
-        c2w_list = [c2w_list[i] for i in sampled_indices]
-        K_list = [K_list[i] for i in sampled_indices]
-    else:
-        poses = [poses[i] for i in sampled_indices[:num_views]]
-        c2w_list = [c2w_list[i] for i in sampled_indices[:num_views]]
-        K_list = [K_list[i] for i in sampled_indices[:num_views]]
+    if use_ges:
+        poses, c2w_list, K_list, orig_width, orig_height = ges_utils.convert_ges_to_mapanything_from_file(
+            ges_path, ref_frame=0
+        )
+        if num_views == -1:
+            poses = [poses[i] for i in sampled_indices]
+            c2w_list = [c2w_list[i] for i in sampled_indices]
+            K_list = [K_list[i] for i in sampled_indices]
+        else:
+            poses = [poses[i] for i in sampled_indices[:num_views]]
+            c2w_list = [c2w_list[i] for i in sampled_indices[:num_views]]
+            K_list = [K_list[i] for i in sampled_indices[:num_views]]
 
-    assert len(views) == len(poses) == len(c2w_list) == len(K_list), (
-        "Lengths of views, poses, c2w_list, and K_list must be equal"
-    )
+        assert len(views) == len(poses) == len(c2w_list) == len(K_list), (
+            "Lengths of views, poses, c2w_list, and K_list must be equal"
+        )
 
-    for i in range(len(views)):
-        h_new, w_new = views[i]["true_shape"][0]
-        K = K_list[i].copy()
-        scale_x = w_new / orig_width
-        scale_y = h_new / orig_height
-        K[0, 0] *= scale_x  # fl_x
-        K[0, 2] *= scale_x  # cx
-        K[1, 1] *= scale_y  # fl_y
-        K[1, 2] *= scale_y  # cy
 
-        # load_images() yields CPU tensors; MapAnything.infer() moves views to the model device.
-        # Modular model.forward() does not, so for that path we put geometry + img on ``dev`` here.
-        view_device = dev if modular_model else views[i]["img"].device
-        views[i]["intrinsics"] = torch.tensor(K, dtype=torch.float32, device=view_device)[
-            None
-        ]
-        views[i]["camera_poses"] = torch.tensor(
-            c2w_list[i], dtype=torch.float32, device=view_device
-        )[None]
-        views[i]["is_metric_scale"] = False
-        if modular_model:
-            views[i]["img"] = views[i]["img"].to(dev, non_blocking=True)
+        for i in range(len(views)):
+            h_new, w_new = views[i]["true_shape"][0]
+            K = K_list[i].copy()
+            scale_x = w_new / orig_width
+            scale_y = h_new / orig_height
+            K[0, 0] *= scale_x  # fl_x
+            K[0, 2] *= scale_x  # cx
+            K[1, 1] *= scale_y  # fl_y
+            K[1, 2] *= scale_y  # cy
+
+            # load_images() yields CPU tensors; MapAnything.infer() moves views to the model device.
+            # Modular model.forward() does not, so for that path we put geometry + img on ``dev`` here.
+            view_device = dev if modular_model else views[i]["img"].device
+            views[i]["intrinsics"] = torch.tensor(K, dtype=torch.float32, device=view_device)[
+                None
+            ]
+            views[i]["camera_poses"] = torch.tensor(
+                c2w_list[i], dtype=torch.float32, device=view_device
+            )[None]
+            views[i]["is_metric_scale"] = False
+            if modular_model:
+                views[i]["img"] = views[i]["img"].to(dev, non_blocking=True)
 
     if modular_model:
         print(f"Running modular model {modular_model!r}...")
@@ -196,6 +199,7 @@ def run_mapanything(
             mask_edges=True,
             use_amp=True,
             amp_dtype="bf16",
+            use_multiview_confidence=False,
         )
         print("MapAnything model run complete...")
 
@@ -383,6 +387,46 @@ def save_language_features(predictions, language_features, output_path, ipca=Non
     print(f"[MapAnything] Saved {mask_flat.sum()} points to {output_path}")
 
 
+def compute_scene_bbox(predictions, percentile=1.0):
+    """
+    Compute an axis-aligned bounding box over all valid world points across all frames.
+
+    Uses percentile-based clipping to exclude outlier/floating points. For example,
+    percentile=1.0 clips the outermost 1% of points on each axis.
+
+    Args:
+        predictions : list of dicts from run_mapanything()
+        percentile  : fraction (0-50) to clip from each end on each axis. 0 = tight AABB.
+
+    Returns:
+        bbox_min : np.ndarray (3,) — lower corner in world coords
+        bbox_max : np.ndarray (3,) — upper corner in world coords
+    """
+    all_pts = []
+    for pred in predictions:
+        pts3d, valid_mask = depthmap_to_world_frame(
+            pred["depth_z"][0].squeeze(-1),
+            pred["intrinsics"][0],
+            pred["camera_poses"][0],
+        )
+        mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
+        mask = mask & valid_mask.cpu().numpy()
+        all_pts.append(pts3d.cpu().numpy()[mask])
+
+    all_pts = np.concatenate(all_pts, axis=0)
+    if percentile > 0:
+        bbox_min = np.percentile(all_pts, percentile, axis=0)
+        bbox_max = np.percentile(all_pts, 100.0 - percentile, axis=0)
+    else:
+        bbox_min = all_pts.min(axis=0)
+        bbox_max = all_pts.max(axis=0)
+
+    print(f"[bbox] X: [{bbox_min[0]:.2f}, {bbox_max[0]:.2f}]  "
+          f"Y: [{bbox_min[1]:.2f}, {bbox_max[1]:.2f}]  "
+          f"Z: [{bbox_min[2]:.2f}, {bbox_max[2]:.2f}]")
+    return bbox_min, bbox_max
+
+
 def integrate_tsdf(
     predictions,
     voxel_length: float = 0.2,
@@ -392,6 +436,7 @@ def integrate_tsdf(
     conf_percentile: float = 10.0,
     outlier_nb_neighbors: int = 20,
     outlier_std_ratio: float = 2.0,
+    smooth_iterations: int = 10,
 ):
     """
     Fuse per-frame depth maps from run_mapanything() into a TSDF volume
@@ -408,6 +453,8 @@ def integrate_tsdf(
                               Only applied when pred["conf"] is present.
         outlier_nb_neighbors: neighbors to consider for statistical outlier removal on the mesh vertices.
         outlier_std_ratio   : std-dev threshold for outlier removal; lower = more aggressive.
+        smooth_iterations   : Taubin smoothing passes after extraction. Removes voxel stairstepping
+                              without shrinking the mesh. 0 to disable.
 
     Returns:
         mesh : open3d.geometry.TriangleMesh
@@ -432,7 +479,7 @@ def integrate_tsdf(
 
     for pred in predictions:
         depth_np = np.ascontiguousarray(pred["depth_z"][0].squeeze(-1).cpu().float().numpy())
-        rgb_np = np.ascontiguousarray((pred["img_no_norm"][0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8))
+        rgb_np = np.ascontiguousarray(pred["img_no_norm"][0].cpu().numpy().clip(0, 1).astype(np.float32))
         mask_np = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
         depth_np[~mask_np] = 0.0
 
@@ -462,7 +509,17 @@ def integrate_tsdf(
             depth_scale=1.0, depth_max=depth_trunc
         )
 
-    mesh = vbg.extract_triangle_mesh().to_legacy()
+    t_mesh = vbg.extract_triangle_mesh()
+    mesh = t_mesh.to_legacy()
+    # to_legacy() does not reliably carry vertex colors from VBG tensor meshes
+    if not mesh.has_vertex_colors():
+        for attr in ("colors", "color"):
+            if attr in t_mesh.vertex:
+                colors = t_mesh.vertex[attr].numpy().astype(np.float64)
+                if colors.max() > 1.0:
+                    colors /= 255.0
+                mesh.vertex_colors = o3d.utility.Vector3dVector(colors.clip(0, 1))
+                break
     mesh.compute_vertex_normals()
 
     if outlier_nb_neighbors > 0:
@@ -474,8 +531,83 @@ def integrate_tsdf(
         mesh = mesh.select_by_index(inlier_idx)
         mesh.compute_vertex_normals()
 
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=smooth_iterations)
+        mesh.compute_vertex_normals()
+
     return mesh
 
+
+def reproject_colors_onto_mesh(mesh, predictions):
+    """
+    Replace TSDF-averaged per-vertex colors with colors sampled directly from the
+    best-angle camera for each vertex. Produces sharper, less blurry colors than
+    TSDF color averaging.
+
+    For each vertex, the camera whose optical axis is most aligned with the vertex
+    normal (i.e. most frontal view) is chosen, and the color is bilinearly sampled
+    from that frame's img_no_norm.
+
+    Args:
+        mesh        : open3d.geometry.TriangleMesh (must have vertex_normals computed)
+        predictions : list of dicts from run_mapanything()
+
+    Returns:
+        mesh with updated vertex_colors (in-place and returned)
+    """
+    import open3d as o3d
+
+    vertices = np.asarray(mesh.vertices)       # (N, 3)
+    normals  = np.asarray(mesh.vertex_normals) # (N, 3)
+    N = len(vertices)
+
+    best_cos = np.full(N, -np.inf)
+    colors   = np.zeros((N, 3), dtype=np.float64)
+
+    for pred in predictions:
+        img = pred["img_no_norm"][0].cpu().numpy()  # (H, W, 3) in [0, 1]
+        H, W = img.shape[:2]
+        K   = pred["intrinsics"][0].cpu().numpy()
+        c2w = pred["camera_poses"][0].cpu().numpy()
+        w2c = np.linalg.inv(c2w)
+
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        verts_cam = (w2c[:3, :3] @ vertices.T).T + w2c[:3, 3]  # (N, 3)
+        in_front  = verts_cam[:, 2] > 0
+
+        u = verts_cam[:, 0] / np.where(in_front, verts_cam[:, 2], 1) * fx + cx
+        v = verts_cam[:, 1] / np.where(in_front, verts_cam[:, 2], 1) * fy + cy
+
+        in_bounds = in_front & (u >= 0) & (u < W - 1) & (v >= 0) & (v < H - 1)
+
+        # Prefer cameras that face the surface head-on
+        ray = c2w[:3, 3] - vertices                             # (N, 3)
+        ray /= np.linalg.norm(ray, axis=1, keepdims=True) + 1e-8
+        cos_angle = (normals * ray).sum(axis=1)                 # (N,)
+
+        update = in_bounds & (cos_angle > best_cos)
+        if not update.any():
+            continue
+
+        # Bilinear sample
+        u0 = np.floor(u[update]).astype(int).clip(0, W - 2)
+        v0 = np.floor(v[update]).astype(int).clip(0, H - 2)
+        du = (u[update] - u0)[..., None]
+        dv = (v[update] - v0)[..., None]
+
+        sampled = (
+            img[v0,     u0    ] * (1 - dv) * (1 - du)
+            + img[v0,   u0 + 1] * (1 - dv) * du
+            + img[v0 + 1, u0  ] * dv       * (1 - du)
+            + img[v0 + 1, u0 + 1] * dv     * du
+        )
+
+        colors[update]   = sampled
+        best_cos[update] = cos_angle[update]
+
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors.clip(0, 1))
+    return mesh
 
 class SceneQueryer:
     """
