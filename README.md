@@ -46,12 +46,24 @@ This repo vendors **[lseg-minimal](https://github.com/krrish94/lseg-minimal.git)
 
    ```bash
    cd map-anything
-   ## use pip install -e ".[all]" for all dependecuess to run vggt etc
+   ## use pip install -e ".[all]" for all dependencies to run vggt etc
    pip install -e . 
    cd ..
    ```
 
-6. **`rescue` as a library** (from the RESCUE repo root, after the steps above):
+6. **Download Renders**
+
+   The dataset renders can be downloaded using
+
+   ```bash
+   pip install gdown
+   mkdir -p generated/renders
+   gdown --folder https://drive.google.com/drive/folders/1zqisevgIJ_X6RczFZE54lGKOAFn1UheX -O generated/renders
+   ```
+
+   This will download all files in the `renders` folder to `generated/renders/`.
+
+7. **`rescue` as a library** (from the RESCUE repo root, after the steps above):
 
    ```bash
    pip install -e .
